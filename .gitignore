@@ -1,0 +1,236 @@
+# =============================================================================
+# DevSecOps Project - .gitignore
+# Comprehensive ignore rules for Terraform, AWS, Puppet, Kubernetes, and VMware
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# SECRETS & CREDENTIALS (CRITICAL - NEVER COMMIT)
+# -----------------------------------------------------------------------------
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+secrets.yml
+secrets.yaml
+secrets.json
+**/credentials
+**/credentials.json
+**/.aws/
+*.secret
+*.secrets
+.env
+.env.*
+!.env.example
+
+# AWS specific
+aws-credentials
+aws_credentials
+.aws-credentials
+
+# -----------------------------------------------------------------------------
+# TERRAFORM
+# -----------------------------------------------------------------------------
+# Local .terraform directories
+**/.terraform/*
+
+# .tfstate files
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Crash log files
+crash.log
+crash.*.log
+
+# Exclude all .tfvars files, which are likely to contain sensitive data
+*.tfvars
+*.tfvars.json
+
+# Ignore override files as they are usually used to override resources locally
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Ignore CLI configuration files
+.terraformrc
+terraform.rc
+
+# Terraform lock files (optional - some teams commit these)
+# .terraform.lock.hcl
+
+# -----------------------------------------------------------------------------
+# TERRAFORM STATE & LOGS
+# -----------------------------------------------------------------------------
+**/state/*.tfstate
+**/state/*.tfstate.backup
+*.log
+**/*.log
+
+# -----------------------------------------------------------------------------
+# VMWARE / VIRTUAL MACHINES
+# -----------------------------------------------------------------------------
+# VMware virtual machine files
+*.vmdk
+*.vmx
+*.vmxf
+*.vmsd
+*.vmsn
+*.nvram
+*.vmem
+*.vmss
+*.scoreboard
+mksSandbox*.log
+vmware*.log
+
+# -----------------------------------------------------------------------------
+# PYTHON
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+ENV/
+env/
+
+# -----------------------------------------------------------------------------
+# NODE.JS
+# -----------------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# -----------------------------------------------------------------------------
+# IDE & EDITORS
+# -----------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+*.sublime-workspace
+*.sublime-project
+
+# -----------------------------------------------------------------------------
+# OS GENERATED FILES
+# -----------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# -----------------------------------------------------------------------------
+# KUBERNETES
+# -----------------------------------------------------------------------------
+kubeconfig
+*.kubeconfig
+.kube/
+
+# -----------------------------------------------------------------------------
+# PUPPET
+# -----------------------------------------------------------------------------
+# Puppet module dependencies
+modules/
+!aws/modules/
+spec/fixtures/modules/
+.librarian/
+.tmp/
+Puppetfile.lock
+
+# r10k
+.r10k/
+
+# -----------------------------------------------------------------------------
+# LOGS & TEMPORARY FILES
+# -----------------------------------------------------------------------------
+*.log
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+*.orig
+
+# Process ID files
+*.pid
+*.txt
+!README.txt
+
+# -----------------------------------------------------------------------------
+# BUILD OUTPUTS
+# -----------------------------------------------------------------------------
+/out/
+/output/
+/target/
+/bin/
+/obj/
+
+# -----------------------------------------------------------------------------
+# DIAGRAMS (keep .py source, ignore generated if needed)
+# -----------------------------------------------------------------------------
+# Uncomment if you want to ignore generated diagram images
+# aws/diagrams/**/*.png
+
+# -----------------------------------------------------------------------------
+# PROJECT SPECIFIC
+# -----------------------------------------------------------------------------
+# Security documentation (contains info about removed secrets)
+SECURITY.md
+
+# Infrastructure deployment scripts (may contain credentials or sensitive paths)
+deploy-infrastructure.ps1
+verify-deployment.ps1
+connect-k8s-control-plane.ps1
+connect-*.ps1
+**/deploy-*.ps1
+**/verify-*.ps1
+
+# State directory - contains operational scripts and logs
+aws/state/
+
+# Embedded git repositories
+aws/.gitops/
+
+
+# On-premise test VM files (large binary files)
+terraform-onpremise-tests/Ubuntu-template/*.vmdk
+terraform-onpremise-tests/Ubuntu-template/*.vmx
+terraform-onpremise-tests/Ubuntu-template/*.vmxf
+terraform-onpremise-tests/Ubuntu-template/*.vmsd
+terraform-onpremise-tests/Ubuntu-template/*.vmsn
+terraform-onpremise-tests/Ubuntu-template/*.nvram
+terraform-onpremise-tests/Ubuntu-template/*.scoreboard
+terraform-onpremise-tests/Ubuntu-template/*.log
+
+# State directory logs and temp files
+aws/state/*.log
+aws/state/*.txt
+aws/state/*.pid

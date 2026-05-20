@@ -1,0 +1,20 @@
+# Inventaire des serveurs (VMs) à provisionner via Terraform
+#
+# Champs:
+#   name        : nom unique de la VM (sera aussi le nom du dossier .vmx)
+#   description : annotation visible dans VMware
+#   template_id : ID vmrest de la VM source à cloner
+#   processors  : nombre de vCPU
+#   memory      : RAM en MB (doit être un multiple de 4)
+#   state       : "on" ou "off"
+#
+# Pour ajouter un serveur, il suffit de copier un bloc et de modifier les valeurs.
+
+servers: 
+  # Exemple: décommente pour ajouter un second serveur
+  # web01:
+  #   description: "Serveur web Nginx"
+  #   template_id: "BKJUBILPAADFECD9VB2MC70I0E43613B"
+  #   processors:  2
+  #   memory:      4096
+  #   state:       "on"

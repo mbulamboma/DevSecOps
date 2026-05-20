@@ -1,0 +1,58 @@
+#!/bin/bash
+# Bootstraps PuppetDB on Ubuntu 22.04. PuppetDB stores all data in the shared
+# RDS PostgreSQL. Exposes HTTP API on :8080 — the internal ALB front-ends it.
+#
+# Template vars (Terraform):
+#   ${rds_host}, ${rds_port}, ${rds_user}, ${rds_password}
+set -euxo pipefail
+exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
+export DEBIAN_FRONTEND=noninteractive
+
+RDS_HOST='${rds_host}'
+RDS_PORT='${rds_port}'
+RDS_USER='${rds_user}'
+RDS_PASSWORD='${rds_password}'
+PDB_DB="puppetdb"
+
+retry() { local n=0 m=5; until "$@"; do n=$((n+1)); [ $n -ge $m ] && return 1; sleep 10; done; }
+
+hostnamectl set-hostname "puppetdb.internal" || true
+
+retry apt-get update -y
+retry apt-get install -y --no-install-recommends curl wget gnupg ca-certificates postgresql-client
+
+# Puppet 7 APT repo
+retry wget -q https://apt.puppet.com/puppet7-release-jammy.deb -O /tmp/puppet.deb
+dpkg -i /tmp/puppet.deb
+retry apt-get update -y
+
+# Wait for RDS, create puppetdb database + pg_trgm extension
+for i in $(seq 1 60); do pg_isready -h "$RDS_HOST" -p "$RDS_PORT" -U "$RDS_USER" && break; sleep 10; done
+export PGPASSWORD="$RDS_PASSWORD"
+ex=$(psql -h "$RDS_HOST" -U "$RDS_USER" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$PDB_DB'" || true)
+if [ "$ex" != "1" ]; then
+  psql -h "$RDS_HOST" -U "$RDS_USER" -d postgres -c "CREATE DATABASE \"$PDB_DB\";"
+fi
+psql -h "$RDS_HOST" -U "$RDS_USER" -d "$PDB_DB" -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+unset PGPASSWORD
+
+# Install puppetdb (also pulls puppet-agent)
+retry apt-get install -y --no-install-recommends puppetdb
+
+# Wire to RDS
+cat > /etc/puppetlabs/puppetdb/conf.d/database.ini <<EOF
+[database]
+subname = //$RDS_HOST:$RDS_PORT/$PDB_DB
+username = $RDS_USER
+password = $RDS_PASSWORD
+EOF
+chown puppetdb:puppetdb /etc/puppetlabs/puppetdb/conf.d/database.ini
+chmod 0640 /etc/puppetlabs/puppetdb/conf.d/database.ini
+
+# Make HTTP listener bind to 0.0.0.0:8080 so the internal ALB can reach it
+sed -i 's|^#\?host *=.*|host = 0.0.0.0|; s|^#\?port *=.*|port = 8080|' \
+  /etc/puppetlabs/puppetdb/conf.d/jetty.ini
+
+systemctl enable --now puppetdb
+
+echo "=== PuppetDB bootstrap complete ==="

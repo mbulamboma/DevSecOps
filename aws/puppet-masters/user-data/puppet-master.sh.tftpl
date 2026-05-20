@@ -1,0 +1,166 @@
+#!/bin/bash
+# Bootstraps a Puppet 7 master (puppetserver) + r10k on Ubuntu 22.04.
+#   * Reports to PuppetDB through the internal ALB.
+#   * Pulls Puppet code from a GitHub control repo every minute via r10k.
+#
+# Template vars (Terraform):
+#   ${puppetdb_host}            - internal ALB DNS for PuppetDB stack
+#   ${puppetdb_port}            - 8080
+#   ${control_repo_url}         - GitHub URL of the control repo (HTTPS or git@)
+#   ${control_repo_deploy_key}  - optional SSH private key for private repos
+set -euxo pipefail
+# Kill needrestart dpkg hook — it stalls/aborts apt installs on Ubuntu 22.04 AMI ami-024e6efaf93d85776
+rm -f /etc/dpkg/dpkg.cfg.d/needrestart /etc/apt/apt.conf.d/99needrestart 2>/dev/null || true
+exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1
+
+PUPPETDB_HOST='${puppetdb_host}'
+PUPPETDB_PORT='${puppetdb_port}'
+CONTROL_REPO_URL='${control_repo_url}'
+CONTROL_REPO_DEPLOY_KEY='${control_repo_deploy_key}'
+
+retry() { local n=0 m=5; until "$@"; do n=$((n+1)); [ $n -ge $m ] && return 1; sleep 10; done; }
+
+hostnamectl set-hostname "puppet-master.internal" || true
+
+retry apt-get update -y
+retry apt-get install -y --no-install-recommends curl wget gnupg ca-certificates git openssh-client awscli
+
+# Publish own private IP to SSM so k8s slaves can target the master directly
+# (layer-7 ALB cannot proxy puppetserver's HTTPS-mTLS on :8140).
+PRIVATE_IP="$(hostname -I | awk '{print $1}')"
+TOKEN="$(curl -s -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' || echo)"
+if [ -n "$TOKEN" ]; then
+  REGION="$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)"
+  aws ssm put-parameter \
+    --region "$REGION" \
+    --name /puppet/master/private-ip \
+    --type String --overwrite \
+    --value "$PRIVATE_IP" || true
+fi
+
+retry wget -q https://apt.puppet.com/puppet7-release-jammy.deb -O /tmp/puppet.deb
+dpkg -i /tmp/puppet.deb
+retry apt-get update -y
+retry apt-get install -y --no-install-recommends puppetserver
+
+# Tune JVM heap for t3.medium (4 GB RAM) — default 2g/2g OOMs on this size
+sed -i 's/-Xms2g/-Xms512m/;s/-Xmx2g/-Xmx1g/' /etc/default/puppetserver
+
+systemctl enable puppetserver
+
+# ----- PuppetDB wiring -------------------------------------------------------
+# Install the puppetdb-termini gem INTO the puppetserver gemset (NOT the agent gemset)
+# This is required for `routes.yaml` -> `terminus: puppetdb` and `storeconfigs_backend puppetdb`
+# Without it, puppetserver fails to start with: "Could not find terminus puppetdb for indirection facts"
+# JVM gem path can hang on Ubuntu 22.04 + puppetserver 7; fall back to apt package if it does.
+timeout 300 /opt/puppetlabs/bin/puppetserver gem install --no-document puppetdb-termini \
+  || retry apt-get install -y --no-install-recommends puppetdb-termini \
+  || /opt/puppetlabs/bin/puppet resource package puppetdb-termini ensure=installed provider=apt
+
+install -d -m 0755 /etc/puppetlabs/puppet
+cat > /etc/puppetlabs/puppet/puppetdb.conf <<EOF
+[main]
+server_urls = http://$PUPPETDB_HOST:$PUPPETDB_PORT
+EOF
+
+cat > /etc/puppetlabs/puppet/routes.yaml <<EOF
+---
+master:
+  facts:
+    terminus: puppetdb
+    cache: yaml
+EOF
+
+# puppet binary is at /opt/puppetlabs/bin/puppet — not yet on PATH at this point in user-data
+PUPPET=/opt/puppetlabs/bin/puppet
+$PUPPET config set --section master storeconfigs true              || true
+$PUPPET config set --section master storeconfigs_backend puppetdb  || true
+$PUPPET config set --section master reports puppetdb               || true
+
+# ----- Autosign for trusted node names -----
+# k8s nodes and any *.k8s.internal / *.compute.internal hosts are auto-signed.
+cat > /etc/puppetlabs/puppet/autosign.conf <<EOF
+k8s-control-plane
+k8s-worker-node
+*.k8s.internal
+*.us-east-2.compute.internal
+EOF
+chmod 0644 /etc/puppetlabs/puppet/autosign.conf
+$PUPPET config set --section master autosign /etc/puppetlabs/puppet/autosign.conf || true
+
+# ----- r10k + GitOps from GitHub --------------------------------------------
+# The bundled puppetserver gem path ships Ruby 2.7 — modern r10k pins
+# minitar >= 1.0.2 which requires Ruby >= 3.1, so `gem install r10k` from
+# the puppetlabs gem path FAILS. We use Ubuntu's distro `r10k` package (in
+# universe) which ships its own Ruby + r10k binary and works out of the box.
+retry add-apt-repository -y universe || true
+retry apt-get update -y
+retry apt-get install -y --no-install-recommends r10k
+R10K_BIN="$(command -v r10k || echo /usr/bin/r10k)"
+
+if [ -n "$CONTROL_REPO_DEPLOY_KEY" ]; then
+  install -d -m 0700 /root/.ssh
+  printf "%s\n" "$CONTROL_REPO_DEPLOY_KEY" > /root/.ssh/id_rsa
+  chmod 0600 /root/.ssh/id_rsa
+  ssh-keyscan -H github.com >> /root/.ssh/known_hosts 2>/dev/null || true
+fi
+
+install -d -m 0755 /etc/puppetlabs/r10k
+cat > /etc/puppetlabs/r10k/r10k.yaml <<EOF
+---
+cachedir: /var/cache/r10k
+sources:
+  control:
+    remote: $CONTROL_REPO_URL
+    basedir: /etc/puppetlabs/code/environments
+EOF
+install -d -m 0755 /var/cache/r10k /etc/puppetlabs/code/environments
+
+cat > /usr/local/sbin/r10k-deploy <<EOF
+#!/bin/bash
+exec >> /var/log/r10k-deploy.log 2>&1
+echo "=== \$(date -Is) deploy start ==="
+$R10K_BIN deploy environment -p -v || echo "r10k FAILED (will retry next tick)"
+echo "=== \$(date -Is) deploy end ==="
+EOF
+chmod 0755 /usr/local/sbin/r10k-deploy
+
+if [ -n "$CONTROL_REPO_URL" ]; then
+  /usr/local/sbin/r10k-deploy || true
+fi
+
+cat > /etc/cron.d/r10k-deploy <<'EOF'
+* * * * * root /usr/local/sbin/r10k-deploy
+EOF
+chmod 0644 /etc/cron.d/r10k-deploy
+
+# ----- Start master, wait for r10k content, THEN run agent locally
+systemctl restart puppetserver || systemctl start puppetserver
+
+# Wait for r10k to populate the production environment before first agent run
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  [ -d /etc/puppetlabs/code/environments/production/manifests ] && break
+  /usr/local/sbin/r10k-deploy || true
+  sleep 15
+done
+
+/opt/puppetlabs/bin/puppet config set --section agent runinterval 300
+/opt/puppetlabs/bin/puppet config set --section agent server "$(hostname -f)"
+/opt/puppetlabs/bin/puppet agent --test --waitforcert 60 || true
+systemctl enable --now puppet || true
+
+curl -sf "http://$PUPPETDB_HOST:$PUPPETDB_PORT/pdb/meta/v1/version" || true
+
+# ----- ALB readiness gate -----
+# Target group health check hits /status/v1/services on :8140. Block until it answers.
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  if curl -fsS "http://localhost:8140/status/v1/services?level=critical" >/dev/null; then
+    echo "MASTER_READY"
+    break
+  fi
+  sleep 30
+done
+
+echo "=== Puppet Master bootstrap complete (PuppetDB: $PUPPETDB_HOST:$PUPPETDB_PORT) ==="

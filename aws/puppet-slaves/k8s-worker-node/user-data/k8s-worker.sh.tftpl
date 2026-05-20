@@ -1,0 +1,135 @@
+#!/bin/bash
+# Self-bootstrapping Kubernetes 1.30 worker (Ubuntu 22.04).
+# No Puppet dependency. Installs containerd + k8s, then polls SSM Parameter
+# Store for the kubeadm join command published by the control plane.
+set -euxo pipefail
+
+exec > >(tee /var/log/user-data.log) 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+export NEEDRESTART_SUSPEND=1
+
+NODE_NAME="${node_name}"
+WORKER_FQDN="${worker_fqdn}"
+SSM_JOIN_PARAM="${ssm_join_param}"
+REGION="us-east-2"
+
+hostnamectl set-hostname "$NODE_NAME"
+echo "127.0.1.1 $NODE_NAME $WORKER_FQDN" >> /etc/hosts
+
+# ---- Neutralize needrestart / apt-daily ----
+rm -f /etc/dpkg/dpkg.cfg.d/needrestart \
+      /etc/apt/apt.conf.d/99needrestart \
+      /etc/apt/apt.conf.d/99-needrestart || true
+systemctl stop apt-daily.timer apt-daily-upgrade.timer unattended-upgrades 2>/dev/null || true
+systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+apt-get -y remove --purge needrestart 2>/dev/null || true
+
+# ---- Idempotency: already joined ----
+if [ -f /etc/kubernetes/kubelet.conf ] && systemctl is-active --quiet kubelet; then
+  echo "Worker already joined - skipping"
+  exit 0
+fi
+
+# ---- Kernel prerequisites ----
+swapoff -a || true
+sed -i '/ swap / s/^/#/' /etc/fstab
+cat >/etc/modules-load.d/k8s.conf <<EOF
+overlay
+br_netfilter
+EOF
+modprobe overlay || true
+modprobe br_netfilter || true
+cat >/etc/sysctl.d/k8s.conf <<EOF
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+sysctl --system >/dev/null
+
+# ---- containerd + k8s repo + binaries ----
+retry() { for i in 1 2 3 4 5; do "$@" && return 0; sleep $((i*5)); done; return 1; }
+
+retry apt-get update -y
+retry apt-get install -y apt-transport-https ca-certificates curl gpg socat conntrack ebtables ethtool containerd awscli jq
+
+mkdir -p /etc/containerd
+containerd config default >/etc/containerd/config.toml
+sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+systemctl restart containerd
+systemctl enable containerd
+
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /' >/etc/apt/sources.list.d/kubernetes.list
+retry apt-get update -y
+apt-mark unhold kubelet kubeadm kubectl 2>/dev/null || true
+retry apt-get install -y --allow-change-held-packages kubelet kubeadm kubectl
+apt-mark hold kubelet kubeadm kubectl
+systemctl enable --now kubelet
+
+# ---- Poll SSM for join command (control plane publishes it after kubeadm init) ----
+JOIN=""
+for i in $(seq 1 80); do
+  JOIN=$(aws ssm get-parameter --name "$SSM_JOIN_PARAM" --with-decryption --region "$REGION" --query Parameter.Value --output text 2>/dev/null || true)
+  if [ -n "$JOIN" ] && echo "$JOIN" | grep -q 'kubeadm join'; then
+    break
+  fi
+  echo "Waiting for SSM join command (attempt $i)..."
+  sleep 15
+done
+
+if [ -z "$JOIN" ] || ! echo "$JOIN" | grep -q 'kubeadm join'; then
+  echo "FATAL: join command never appeared in SSM" >&2
+  exit 1
+fi
+
+# ---- Join cluster ----
+eval "$JOIN --node-name=$NODE_NAME --ignore-preflight-errors=NumCPU"
+
+echo "WORKER_BOOTSTRAP_DONE"
+
+# =============================================================================
+# Puppet agent stage: register with master and run on cron for GitOps manifests
+# =============================================================================
+# Pull master's private IP from SSM (layer-7 ALB cannot proxy mTLS).
+PUPPET_MASTER=""
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  PUPPET_MASTER="$(aws ssm get-parameter --region "$REGION" --name /puppet/master/private-ip --query Parameter.Value --output text 2>/dev/null || true)"
+  if [ -n "$PUPPET_MASTER" ] && [ "$PUPPET_MASTER" != "None" ]; then break; fi
+  sleep 15
+done
+if [ -z "$PUPPET_MASTER" ] || [ "$PUPPET_MASTER" = "None" ]; then
+  PUPPET_MASTER="${puppet_master}"
+fi
+if [ -z "$PUPPET_MASTER" ]; then
+  echo "WARN: no puppet master discovered — skipping puppet stage" >&2
+  echo "PUPPET_AGENT_SKIPPED"
+  exit 0
+fi
+
+if [ ! -x /opt/puppetlabs/bin/puppet ]; then
+  wget -q https://apt.puppet.com/puppet7-release-jammy.deb -O /tmp/puppet7.deb \
+    && dpkg -i /tmp/puppet7.deb \
+    && retry apt-get update -y \
+    && retry apt-get install -y puppet-agent
+else
+  echo "puppet-agent already installed - skipping install"
+fi
+
+/opt/puppetlabs/bin/puppet config set --section main server "$${PUPPET_MASTER}"
+/opt/puppetlabs/bin/puppet config set --section main environment production
+/opt/puppetlabs/bin/puppet config set --section main certname "$${NODE_NAME}"
+
+# First puppet run with autosign retry; never fail user-data if puppet hiccups
+(
+  for i in 1 2 3 4 5; do
+    /opt/puppetlabs/bin/puppet agent --test --waitforcert 60 --server "$${PUPPET_MASTER}" && break
+    sleep 30
+  done
+) >/var/log/puppet-agent-first.log 2>&1 || true
+
+systemctl enable --now puppet || true
+
+echo "PUPPET_AGENT_BOOTSTRAP_DONE"
