@@ -1,75 +1,82 @@
 """
-GitOps flow — git push to GitHub triggers Puppet catalog update on slaves.
-
-  1. Admin pushes commits to control-repo (branch: production)
-  2. r10k cron on Puppet Master ASG pulls latest every minute
-  3. Master compiles catalogs from production environment
-  4. Foreman (public) provides ENC data and node classification
-  5. Puppet agents on k8s nodes run every 5 minutes -> pick up new catalog
-  6. PuppetDB ASG stores facts/reports
+GitOps flow — AWS Architecture with Puppet Server infrastructure.
 """
 
 from diagrams import Cluster, Diagram, Edge
-from diagrams.aws.compute import EC2, EC2AutoScaling as AutoScaling
-from diagrams.aws.database import RDSPostgresqlInstance
-from diagrams.aws.network import ELB
+from diagrams.aws.compute import EC2, EC2AutoScaling
+from diagrams.aws.database import RDS
+from diagrams.aws.network import ALB, Route53, NATGateway, InternetGateway
+from diagrams.aws.security import ACM
 from diagrams.onprem.vcs import Github
-from diagrams.onprem.client import Users
+from diagrams.onprem.client import User
 
-graph_attr = {"fontsize": "16", "labelloc": "t", "pad": "0.5", "splines": "spline"}
+graph_attr = {
+    "fontsize": "10",
+    "bgcolor": "white",
+    "pad": "0.2",
+    "splines": "spline",
+    "nodesep": "0.3",
+    "ranksep": "0.4",
+    "compound": "true",
+}
+
+node_attr = {"fontsize": "8", "width": "1.2", "height": "1.2"}
+edge_attr = {"fontsize": "7"}
 
 with Diagram(
-    "GitOps end-to-end flow (GitHub -> r10k -> Puppet agents)",
+    "GitOps Flow - AWS",
     filename="gitops-flow",
     show=False,
     direction="LR",
     graph_attr=graph_attr,
+    node_attr=node_attr,
+    edge_attr=edge_attr,
 ):
-    dev = Users("Developer")
-    admin = Users("Admin")
+    # External users
+    dev = User("Dev")
+    admin = User("Admin")
+    github = Github("GitHub")
 
-    with Cluster("Step 1 — Source of truth"):
-        gh = Github("control-repo\nproduction branch")
+    with Cluster("AWS VPC"):
+        dns = Route53("R53")
+        acm = ACM("ACM")
+        igw = InternetGateway("IGW")
+        nat = NATGateway("NAT")
+        
+        with Cluster("Public"):
+            foreman_alb = ALB("Foreman\nALB:443")
+            k8s_alb = ALB("K8s Apps\nALB:443")
+        
+        with Cluster("Private - Puppet"):
+            puppet_alb = ALB("Puppet\nALB:8140")
+            pdb_alb = ALB("PuppetDB\nALB:8081")
+            
+            foreman = EC2("Foreman")
+            puppet = EC2("Puppet\nServer")
+            puppetdb = EC2("PuppetDB")
+        
+        with Cluster("Private - K8s"):
+            k8s_cp = EC2("CP")
+            k8s_wk = EC2("Worker")
+            # Force horizontal layout
+            k8s_cp - Edge(style="invis") - k8s_wk
+        
+        rds = RDS("RDS\nPostgres")
 
-    with Cluster("Step 2 — Foreman (Public ALB)"):
-        foreman_alb = ELB("Foreman ALB\nHTTPS :443\n(internet-facing)")
-        foreman_asg = AutoScaling("Foreman ASG\nmin 1 / max 2")
-
-    with Cluster("Step 3 — Pull & Compile (Internal)"):
-        master_alb = ELB("Puppet Master ALB\n:8140 internal")
-        master_asg = AutoScaling("Puppet Master ASG\nmin 1 / max 2\nr10k deploy -p (60s)")
-
-    with Cluster("Step 4 — Apply (agent run every 5m)"):
-        cp = EC2("k8s-control-plane\npuppet-agent")
-        wk = EC2("k8s-worker-node\npuppet-agent")
-
-    with Cluster("Step 5 — Reports (Internal)"):
-        pdb_alb = ELB("PuppetDB ALB\n:8081 internal")
-        pdb_asg = AutoScaling("PuppetDB ASG\nmin 1 / max 2")
-        rds = RDSPostgresqlInstance("RDS Postgres\nforeman + puppetdb")
-
-    # Developer pushes code
-    dev >> Edge(label="git push") >> gh
+    # Flows
+    dev >> Edge(label="push", color="green") >> github
+    github >> Edge(label="r10k", color="green") >> nat >> puppet
     
-    # r10k pulls from GitHub
-    gh >> Edge(label="HTTPS clone\n(every 60s)", color="darkgreen") >> master_asg
+    admin >> dns >> igw >> foreman_alb >> foreman
+    acm - Edge(style="dashed") - foreman_alb
     
-    # Admin manages nodes via Foreman
-    admin >> Edge(label="HTTPS") >> foreman_alb >> foreman_asg
+    foreman >> Edge(label="ENC", style="dashed") >> puppet_alb >> puppet
     
-    # Foreman provides ENC to Puppet Master
-    foreman_asg >> Edge(label="ENC /nodes\n:8140", style="dashed") >> master_alb
+    [k8s_cp, k8s_wk] >> Edge(label="catalog", color="blue") >> puppet_alb
     
-    # Puppet Master serves catalogs
-    master_alb >> master_asg
-    master_asg >> Edge(label="catalog :8140") >> cp
-    master_asg >> Edge(label="catalog :8140") >> wk
-
-    # Agents send facts/reports to PuppetDB
-    cp >> Edge(label="facts/reports") >> pdb_alb
-    wk >> Edge(label="facts/reports") >> pdb_alb
-    pdb_alb >> pdb_asg
+    puppet >> pdb_alb >> puppetdb >> rds
+    foreman >> Edge(style="dashed") >> rds
     
-    # PuppetDB and Foreman share RDS
-    pdb_asg >> Edge(label=":5432") >> rds
-    foreman_asg >> Edge(label=":5432", style="dashed") >> rds
+    # K8s Apps ALB exposes pods
+    igw >> k8s_alb >> Edge(label="pods", color="darkblue") >> k8s_wk
+    acm - Edge(style="dashed") - k8s_alb
